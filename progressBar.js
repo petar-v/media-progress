@@ -263,6 +263,7 @@ export class ProgressBar extends Slider {
         this._refreshInProgress = false;
         this._updateInProgress = false;
         this._destroyed = false;
+        this._lifecycleToken = 0;
 
         this.signals = [];
 
@@ -301,8 +302,36 @@ export class ProgressBar extends Slider {
         return this._coerceNumber(value) / MICROSECONDS_PER_SECOND;
     }
 
+    _isActorAlive() {
+        if (this._destroyed)
+            return false;
+
+        try {
+            return Boolean(this.get_parent?.());
+        } catch {
+            return false;
+        }
+    }
+
+    _isStale(token) {
+        return this._destroyed || token !== this._lifecycleToken || !this._isActorAlive();
+    }
+
+    _setActorProperty(propertyName, value) {
+        if (!this._isActorAlive())
+            return false;
+
+        try {
+            this[propertyName] = value;
+            return true;
+        } catch (error) {
+            _reportError(`Failed to set property ${propertyName} for ${this._busName}`, error, { ignoreTransientDbus: true });
+            return false;
+        }
+    }
+
     _setTimestampText(index, text) {
-        if (this._destroyed || !this.get_parent?.())
+        if (!this._isActorAlive())
             return;
 
         const label = this.timestamps?.[index];
@@ -317,12 +346,18 @@ export class ProgressBar extends Slider {
     }
 
     _setTimestampsVisible(visible) {
-        if (this._destroyed || !this.get_parent?.())
+        if (!this._isActorAlive())
             return;
 
         for (const label of this.timestamps ?? []) {
-            if (label)
+            if (!label)
+                continue;
+
+            try {
                 label.visible = visible;
+            } catch (error) {
+                _reportError(`Failed to set timestamp visibility for ${this._busName}`, error, { ignoreTransientDbus: true });
+            }
         }
     }
 
@@ -330,6 +365,7 @@ export class ProgressBar extends Slider {
         if (this._destroyed || this._refreshInProgress)
             return;
 
+        const lifecycleToken = this._lifecycleToken;
         this._refreshInProgress = true;
         try {
             if (this._dragging)
@@ -338,21 +374,35 @@ export class ProgressBar extends Slider {
             if (!this._length)
                 await this._updateInfo();
 
+            if (this._isStale(lifecycleToken))
+                return;
+
             if (!this._length)
                 return;
 
             let position = this.value * this._length;
             const playbackStatus = await this.getProperty("PlaybackStatus");
+            if (this._isStale(lifecycleToken))
+                return;
+
             if (playbackStatus === "Playing") {
                 const remotePosition = await this.getProperty("Position");
+                if (this._isStale(lifecycleToken))
+                    return;
+
                 if (remotePosition !== null)
                     position = this._coerceNumber(remotePosition);
             }
 
+            if (this._isStale(lifecycleToken))
+                return;
+
             if (!this._length)
                 return;
 
-            this.value = Math.max(MIN_SLIDER_VALUE, Math.min(MAX_SLIDER_VALUE, position / this._length));
+            if (!this._setActorProperty("value", Math.max(MIN_SLIDER_VALUE, Math.min(MAX_SLIDER_VALUE, position / this._length))))
+                return;
+
             this._setTimestampText(0, this._formatDuration(this._microsToSeconds(position)));
         } catch (error) {
             _reportError(`Failed to refresh progress for ${this._busName}`, error, { ignoreTransientDbus: true });
@@ -365,27 +415,42 @@ export class ProgressBar extends Slider {
         if (this._destroyed || this._updateInProgress)
             return;
 
+        const lifecycleToken = this._lifecycleToken;
         this._updateInProgress = true;
         try {
             if (!this._playerProxy)
                 this._initProxy();
 
+            if (this._isStale(lifecycleToken))
+                return;
+
             if (!this._playerProxy)
                 return;
 
             const metadata = await this.getProperty("Metadata");
+            if (this._isStale(lifecycleToken))
+                return;
+
             this._trackId = metadata?.["mpris:trackid"] ?? 0;
             const canSeek = Boolean(await this.getProperty("CanSeek"));
-            this.reactive = Boolean(this._trackId) && canSeek;
+            if (this._isStale(lifecycleToken))
+                return;
+
+            if (!this._setActorProperty("reactive", Boolean(this._trackId) && canSeek))
+                return;
 
             this._length = this._coerceNumber(metadata?.["mpris:length"] ?? 0);
             if (!this._length) {
-                this.visible = false;
+                if (!this._setActorProperty("visible", false))
+                    return;
+
                 this._setTimestampsVisible(false);
                 return;
             }
 
-            this.visible = true;
+            if (!this._setActorProperty("visible", true))
+                return;
+
             this._setTimestampsVisible(true);
             this._setTimestampText(1, this._formatDuration(this._microsToSeconds(this._length)));
         } catch (error) {
@@ -485,6 +550,7 @@ export class ProgressBar extends Slider {
     }
 
     _onDestroy() {
+        this._lifecycleToken += 1;
         this._destroyed = true;
         for (const signalId of this.signals) {
             try {
